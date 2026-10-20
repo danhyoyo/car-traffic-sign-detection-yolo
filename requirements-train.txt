@@ -1,0 +1,9 @@
+-r requirements.txt
+numpy==2.2.6
+roboflow
+python-dotenv
+pyyaml
+matplotlib
+onnx
+onnxruntime
+jupyterlab
