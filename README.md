@@ -1,51 +1,51 @@
-# Traffic Sign Detection — YOLO11 & VIA
+# yolo-traffic-sign-detection-via
 
-Huấn luyện YOLO11s nhận diện 6 biển báo và điều khiển xe trong [VIA Simulator](https://via-sim.makerviet.org/).
+Train YOLO11s to detect six traffic signs and integrate the detector with lane following and vehicle control in the [VIA Simulator](https://via-sim.makerviet.org/).
 
-Phát triển bởi **[danhyoyo](https://github.com/danhyoyo)**, dựa trên tài liệu [MakerViet VIA](https://github.com/makerviet/via-docs).
+Developed by **[danhyoyo](https://github.com/danhyoyo)**, based on the [MakerViet VIA learning resources](https://github.com/makerviet/via-docs).
 
 ## Demo
 
-[![Xe chạy trong VIA Simulator](docs/images/via_demo.gif)](docs/media/car_yolo.mp4)
+[![Autonomous driving in the VIA Simulator](docs/images/via_demo.gif)](docs/media/car_yolo.mp4)
 
-GIF xem trước · [Xem video đầy đủ (MP4)](docs/media/car_yolo.mp4)
+Animated preview · [Watch the full video (MP4)](docs/media/car_yolo.mp4)
 
-## Cấu trúc dự án
+## Project Structure
 
 ```text
-car-traffic-sign-detection-yolo/
-├── simulator/              # Code điều khiển xe và nhận diện biển
+yolo-traffic-sign-detection-via/
+├── simulator/              # Vehicle control and traffic sign detection
 │   ├── drive.py
 │   ├── lane_line_detection.py
 │   ├── traffic_sign_detection.py
 │   ├── yolo_sign_detection.py
 │   └── pid_controller.py
-├── tests/                  # Kiểm thử điều khiển và ánh xạ YOLO
-├── notebooks/              # Notebook 01–07, từ cơ bản đến train YOLO
+├── tests/                  # Controller and YOLO class mapping tests
+├── notebooks/              # Tutorials 01–07, from basics to YOLO training
 ├── models/
-│   ├── traffic_sign_classifier_lenet_v3.onnx  # Bộ phân loại cũ
-│   ├── pretrained/         # Trọng số tải về khi train
-│   └── yolo11/             # Mô hình PT, ONNX và ánh xạ xuất sau train
+│   ├── traffic_sign_classifier_lenet_v3.onnx  # Legacy classifier
+│   ├── pretrained/         # Downloaded pretrained weights
+│   └── yolo11/             # Exported PT, ONNX, and class mapping files
 ├── data/
-│   ├── samples/            # ZIP ảnh mẫu có sẵn
-│   └── datasets/           # Dataset tải từ Roboflow
-├── outputs/                # Kết quả train, đánh giá, dự đoán và ZIP
-├── maps/                   # Bản đồ VIA
+│   ├── samples/            # Included sample image archives
+│   └── datasets/           # Downloaded Roboflow datasets
+├── outputs/                # Training runs, evaluations, predictions, and ZIPs
+├── maps/                   # VIA maps
 ├── docs/
-│   ├── images/             # Hình minh họa và GIF demo
-│   ├── media/              # Video demo đầy đủ
+│   ├── images/             # Illustrations and demo GIF
+│   ├── media/              # Full demo video
 │   └── controller_tuning.md
-├── requirements.txt        # Thư viện chạy simulator
-├── requirements-train.txt  # Thư viện train và xuất ONNX
-├── .env                    # API key cá nhân, không đưa lên Git
-└── .env.example            # Mẫu cấu hình có thể chia sẻ
+├── requirements.txt        # Simulator dependencies
+├── requirements-train.txt  # Training and ONNX export dependencies
+├── .env                    # Local API key; excluded from Git
+└── .env.example            # Shareable configuration template
 ```
 
-`data/datasets/`, `outputs/`, `models/pretrained/` và `models/yolo11/` được tạo khi chạy notebook và được Git bỏ qua. Tên thư mục dùng chữ thường, không khoảng trắng; tên file Python dùng `snake_case`.
+The notebook creates `data/datasets/`, `outputs/`, `models/pretrained/`, and `models/yolo11/` as needed. These generated directories are excluded from Git.
 
-## Cài đặt
+## Setup
 
-Chạy từ thư mục gốc dự án, dùng Python 3.10 trở lên:
+Run from the project root using Python 3.10 or later. On Windows PowerShell:
 
 ```powershell
 python -m venv .venv
@@ -53,54 +53,67 @@ python -m venv .venv
 python -m pip install -r requirements-train.txt
 ```
 
-Trong Jupyter/VS Code, chọn kernel `.venv/Scripts/python.exe`. Môi trường `.venv` đã chuẩn bị trên máy hiện tại kế thừa thư viện CUDA từ `AI` và dùng NumPy 2.2.6 wheel riêng để tránh xung đột MKL/OpenMP. Khi clone sang máy khác, dùng cách tạo môi trường mới ở trên.
+Select `.venv/Scripts/python.exe` as the notebook kernel in Jupyter or VS Code. Training dependencies pin NumPy to 2.2.6; mixing MKL and OpenMP runtimes in an existing Conda environment can cause kernel crashes. Use a project environment when setting up on another machine.
 
-Nếu chỉ chạy xe: cài `requirements.txt`. Train GPU cần PyTorch hỗ trợ CUDA; có thể dùng Colab GPU.
+For simulator use only, install `requirements.txt`. GPU training requires a CUDA-enabled PyTorch installation; a Colab GPU runtime is another option.
 
-## Train và xuất ONNX
+## Training and ONNX Export
 
-1. Mở `notebooks/07_train_yolo11.ipynb` bằng Jupyter hoặc Colab.
-2. Lấy **Private API Key** tại [Roboflow API Settings](https://app.roboflow.com/settings/api), điền vào `.env`:
+1. Open `notebooks/07_train_yolo11.ipynb` in Jupyter or Colab.
+2. Copy your **Private API Key** from [Roboflow API Settings](https://app.roboflow.com/settings/api) into `.env`:
 
 ```dotenv
 ROBOFLOW_API_KEY=your_private_key
 ```
 
-3. Chạy notebook từ trên xuống. Trên Colab, tải `.env` lên `/content`.
+3. Run the notebook cells in order. On Colab, upload `.env` to `/content`.
 
-Dataset: [trafficsign — Sa Tr](https://universe.roboflow.com/sa-tr/trafficsign-jryf1), workspace `sa-tr`, project `trafficsign-jryf1`, version `1`, CC BY 4.0. Các lớp: `left`, `no_left`, `right`, `no_right`, `straight`, `stop`. Notebook kiểm tra đủ nhãn và mẫu train/validation trước khi huấn luyện. Nếu bản tải về chỉ có train, notebook tạo danh sách train/validation/test theo nhóm tên ảnh nguồn (80/10/10, seed 42), giữ các bản tăng cường cùng nguồn trong một tập và không di chuyển ảnh gốc.
+The notebook uses [trafficsign by Sa Tr](https://universe.roboflow.com/sa-tr/trafficsign-jryf1), workspace `sa-tr`, project `trafficsign-jryf1`, version `1`, under CC BY 4.0. Its six classes match the controller actions:
 
-Cấu hình tập trung ở bước 2: YOLO11s, 100 epoch, ảnh 640, batch 8 trên GPU. Hết bộ nhớ thì giảm batch xuống 4 hoặc 2.
+| Class | Meaning |
+| --- | --- |
+| `left` | Turn left |
+| `no_left` | No left turn |
+| `right` | Turn right |
+| `no_right` | No right turn |
+| `straight` | Go straight |
+| `stop` | Stop |
 
-Bước 12 xuất và kiểm tra ONNX; bước 13 lưu vào `models/yolo11/`:
+The notebook checks class coverage and training/validation annotations. If validation data is missing, it creates an 80/10/10 train/validation/test split with seed 42, grouping augmented images by source filename without moving the originals. Different filenames may still represent nearby video frames, so review the split before reporting results.
+
+Training settings are grouped in step 2: YOLO11s, 100 epochs, image size 640, and GPU batch size 8. Reduce the batch size to 4 or 2 if GPU memory runs out. Existing downloaded data is reused.
+
+Step 12 exports and checks ONNX; step 13 saves the following in `models/yolo11/`:
 
 - `bien_bao_best.pt`
 - `bien_bao_best.onnx`
-- `sign_mapping.json`, cấu hình dữ liệu và phiên bản thư viện
+- `sign_mapping.json`, dataset configuration, and dependency versions
 
-Kết quả chi tiết và ZIP nằm trong `outputs/`. Tải ZIP về trước khi kết thúc Colab. Không đưa API key vào notebook hoặc file chia sẻ.
+Detailed results and the ZIP archive are saved in `outputs/`. Download the archive before ending a Colab session. Keep API keys out of notebooks and shared files.
 
-## Chạy mô phỏng
+## Running the Simulator
 
 ```powershell
 python -m simulator.drive
 ```
 
-Mặc định dùng bộ phân loại LeNet trong `models/`. Để dùng YOLO đã train:
+By default, the controller uses the included LeNet classifier in `models/`. To use your trained YOLO detector:
 
 ```powershell
 $env:TRAFFIC_SIGN_MODEL = (Resolve-Path models/yolo11/bien_bao_best.pt).Path
 python -m simulator.drive
 ```
 
-Giữ `sign_mapping.json` cạnh trọng số. Bộ đọc YOLO ánh xạ theo tên lớp và bỏ qua lớp không hỗ trợ. YOLO ONNX là detector toàn ảnh, không thay trực tiếp cho bộ phân loại LeNet 32×32; phần điều khiển hiện dùng `.pt` khi chạy YOLO.
+Keep `sign_mapping.json` beside the weights. The YOLO adapter maps predictions by class name and ignores unsupported classes. The exported YOLO ONNX model detects signs in full images and cannot directly replace the legacy 32×32 LeNet classifier; the driving integration currently uses `.pt` weights for YOLO.
 
-Mở VIA, nạp bản đồ trong `maps/` và kết nối `ws://localhost:4567`. Dừng bằng **Ctrl+C**. Biển rẽ được ghi nhớ tới khi mất làn liên tục tại ngã rẽ; các ngưỡng nằm trong `simulator/drive.py` và `simulator/lane_line_detection.py`. Xem [hướng dẫn cân chỉnh](docs/controller_tuning.md).
+Open VIA, load a map from `maps/`, and connect to `ws://localhost:4567`. Stop the controller with **Ctrl+C**. Confirmed turn signs are remembered until sustained lane loss triggers a turn at a junction. Adjust thresholds in `simulator/drive.py` and `simulator/lane_line_detection.py`; see the [controller tuning notes](docs/controller_tuning.md) (Vietnamese).
 
-## Kiểm tra
+## Tests
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-Bộ kiểm thử dùng ảnh tổng hợp, ảnh mẫu, trạng thái biển báo và kết nối WebSocket. Cần đánh giá mô hình trên camera VIA trước khi dùng cho điều khiển; bộ dữ liệu đủ tên lớp chưa chứng minh độ chính xác trong mô phỏng.
+Tests cover synthetic roads, sample images, sign handling, YOLO class mapping, and WebSocket communication. The latest local run passed 22 of 24 tests; two existing controller tests disagree with the current turn settings.
+
+Evaluate the trained detector on VIA camera frames before using it for control. Matching all six class names does not establish detection accuracy in the simulator.
