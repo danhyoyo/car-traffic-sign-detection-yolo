@@ -13,6 +13,7 @@ Fixed and improved version:
 """
 
 import time
+from queue import Empty
 from typing import List, Optional, Tuple
 
 import cv2
@@ -239,12 +240,28 @@ def process_traffic_sign_loop(image_queue, output_queue=None, model_path: Option
 
     while True:
         try:
-            if image_queue.empty():
-                time.sleep(0.03)
+            try:
+                item = image_queue.get(timeout=0.1)
+            except Empty:
                 continue
-            img = image_queue.get()
-            if img is None:
+            if item is None:
                 break
+            # Process the latest available camera frame, discarding backlog.
+            shutdown = False
+            while True:
+                try:
+                    newer = image_queue.get_nowait()
+                except Empty:
+                    break
+                if newer is None:
+                    shutdown = True
+                    break
+                item = newer
+            if shutdown:
+                break
+            captured_at, img = item if isinstance(item, tuple) else (time.time(), item)
+            if time.time() - captured_at > 0.5:
+                continue
             draw = img.copy()
             try:
                 dets = detector.detect(img, draw=draw)
@@ -260,7 +277,7 @@ def process_traffic_sign_loop(image_queue, output_queue=None, model_path: Option
                         'name': best[0],
                         'score': float(best[5]),
                         'bbox': (int(best[1]), int(best[2]), int(best[3]), int(best[4])),
-                        'ts': time.time()
+                        'ts': captured_at
                     }
                     try:
                         # non-blocking put: if full, discard oldest then put

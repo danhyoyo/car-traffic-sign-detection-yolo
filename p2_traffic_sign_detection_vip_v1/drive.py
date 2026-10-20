@@ -4,8 +4,8 @@ drive.py
 WebSocket server that receives images and returns throttle/steering.
 This version includes:
 - traffic sign confirmation (candidate -> confirmed) logic,
-- execute_after: after a sign is confirmed, wait EXECUTE_AFTER_SECONDS before applying its action,
-  so the car delays executing the action even after confirmation.
+- turn signs are remembered until sustained lane loss at a junction,
+- other signs use EXECUTE_AFTER_SECONDS after confirmation,
 - communication with the sign detection process via two multiprocessing.Queues:
     g_image_queue -> images sent to detector
     g_sign_queue  -> detections received from detector (payloads)
@@ -19,24 +19,23 @@ from io import BytesIO
 from multiprocessing import Process, Queue
 import os
 import time
+from queue import Empty, Full
 
 import cv2
 import numpy as np
 import websockets
 from PIL import Image
 
-# Try to import calculate_control_signal from lane_line_detection
-try:
-    from lane_line_detection import calculate_control_signal
-except Exception:
-    calculate_control_signal = None
+from lane_line_detection import (calculate_control_signal, reset_control_state,
+                                 SteeringLimiter, get_lane_status)
 
 # Import sign process helper (expects process_traffic_sign_loop to accept an output queue)
-from traffic_sign_detection import process_traffic_sign_loop, TrafficSignDetector
+from traffic_sign_detection import process_traffic_sign_loop
 
 # Configuration (tweak to your needs)
-TRAFFIC_SIGN_MODEL = os.getenv("TRAFFIC_SIGN_MODEL", "traffic_sign_classifier_lenet_v3.onnx")
-IMAGE_QUEUE_MAXSIZE = 5
+TRAFFIC_SIGN_MODEL = os.getenv("TRAFFIC_SIGN_MODEL", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "traffic_sign_classifier_lenet_v3.onnx"))
+IMAGE_QUEUE_MAXSIZE = 1
 SIGN_QUEUE_MAXSIZE = 8
 
 # Confirmation/delay params
@@ -44,6 +43,9 @@ CONFIRM_DELAY_SECONDS = 0.1        # require detection to persist >= this to con
 MIN_CONSISTENT_DETECTIONS = 3       # or require this many consistent detections
 MIN_BBOX_AREA = 2800                # min bbox area (px^2) to consider as "near"
 EXECUTE_AFTER_SECONDS = 0.3           # after confirmation, wait this long before executing action
+JUNCTION_LOSS_SECONDS = 0.12          # reject momentary missing lane markings
+PENDING_TURN_TIMEOUT_SECONDS = 15.0   # discard a sign if no junction is reached
+FALLBACK_RIGHT_STEERING = 1.0         # Full normalized steering for unsigned junctions only.
 
 # Active durations of actions (once executed)
 DURATION_BY_SIGN = {
@@ -58,6 +60,10 @@ DURATION_BY_SIGN = {
 # Queues for inter-process communication
 g_image_queue = Queue(maxsize=IMAGE_QUEUE_MAXSIZE)
 g_sign_queue = Queue(maxsize=SIGN_QUEUE_MAXSIZE)
+_pending_turn = None
+_junction_turn_consumed = False
+_unsigned_loss_count = 0
+_unsigned_loss_in_progress = False
 
 # Active sign state (after execution start)
 _sign_state = {
@@ -73,6 +79,7 @@ _sign_candidate = {
     'first_seen_ts': 0.0,
     'last_seen_ts': 0.0,
     'count': 0,
+    'confirmed': False,
     'score': 0.0,
     'bbox': None
 }
@@ -85,6 +92,7 @@ def _reset_candidate():
         'first_seen_ts': 0.0,
         'last_seen_ts': 0.0,
         'count': 0,
+        'confirmed': False,
         'score': 0.0,
         'bbox': None
     }
@@ -95,33 +103,116 @@ def _reset_active():
     _sign_state = {'name': None, 'exec_start': 0.0, 'duration': 0.0, 'score': 0.0}
 
 
+def _reset_sign_session():
+    """Clear remembered signs for a new simulator connection."""
+    global _pending_turn, _junction_turn_consumed
+    global _unsigned_loss_count, _unsigned_loss_in_progress
+    _pending_turn = None
+    _junction_turn_consumed = False
+    _unsigned_loss_count = 0
+    _unsigned_loss_in_progress = False
+    _reset_candidate()
+    _reset_active()
+
+
 def _promote_candidate_to_confirmed(name, score, bbox):
     """
-    When candidate is confirmed, schedule execution at now + EXECUTE_AFTER_SECONDS.
-    We store exec_start as the time execution will begin.
+    Remember turn signs; schedule other signs after the normal delay.
     """
-    global _sign_state
-    exec_at = time.time() + EXECUTE_AFTER_SECONDS
+    global _sign_state, _pending_turn
+    now = time.time()
+    # Repeated sightings must not keep postponing an already scheduled action.
+    if now > _sign_state['exec_start'] + _sign_state['duration']:
+        _reset_active()
+    if _sign_state['name'] is not None:
+        return False
+    if name in ('left', 'right'):
+        if _pending_turn is not None:
+            return False
+        _pending_turn = {'name': name, 'score': score, 'confirmed_at': now}
+        return True
+    exec_at = now + EXECUTE_AFTER_SECONDS
     dur = DURATION_BY_SIGN.get(name, 1.6)
     # We'll set exec_start to exec_at; later _active_sign checks now against exec_start.
     _sign_state = {'name': name, 'exec_start': exec_at, 'duration': dur, 'score': score}
+    return True
+
+
+def _update_junction_turn(lane_status):
+    """Follow remembered signs, or turn hard right on unsigned lane loss.
+
+    A turn consumes this loss event. Re-arm only after the maneuver finishes
+    and lane tracking recovers, so continuous loss cannot restart the turn.
+    """
+    global _pending_turn, _sign_state, _junction_turn_consumed
+    global _unsigned_loss_count, _unsigned_loss_in_progress
+    now = time.time()
+    active = _active_sign()
+    if (_pending_turn is not None
+            and now - _pending_turn['confirmed_at'] > PENDING_TURN_TIMEOUT_SECONDS):
+        _pending_turn = None
+    if lane_status is None:
+        return
+    # Far preview is exclusively for unsigned-junction fallback. A remembered
+    # sign must wait for loss of the original three steering rows.
+    preview_lost = (_pending_turn is None
+                    and lane_status.get('preview_lost', False))
+    if lane_status['reliable'] and not preview_lost:
+        if _sign_state['name'] is None:
+            _junction_turn_consumed = False
+            _unsigned_loss_in_progress = False
+        return
+    if (active is not None or _sign_state['name'] is not None
+            or _junction_turn_consumed):
+        return
+    if _pending_turn is not None:
+        if lane_status['lost_seconds'] < JUNCTION_LOSS_SECONDS:
+            return
+        name = _pending_turn['name']
+        _sign_state = {'name': name, 'exec_start': now,
+                       'duration': DURATION_BY_SIGN[name],
+                       'score': _pending_turn['score']}
+        _pending_turn = None
+    else:
+        # Count distinct unsigned loss episodes, not individual camera frames.
+        if not _unsigned_loss_in_progress:
+            _unsigned_loss_count += 1
+            _unsigned_loss_in_progress = True
+        if _unsigned_loss_count != 2:
+            return
+        # Only the second unsigned loss triggers full right, without a delay.
+        _sign_state = {'name': 'right', 'exec_start': now,
+                       'duration': DURATION_BY_SIGN['right'], 'score': 0.0,
+                       'source': 'lane_loss'}
+    _junction_turn_consumed = True
 
 
 def _update_sign_state_from_queue():
     """
     Non-blocking read of g_sign_queue to update _sign_candidate and schedule execution only
-    when confirmation criteria are met. Confirmed signs are scheduled to execute after EXECUTE_AFTER_SECONDS.
+    when confirmation criteria are met. Turns wait for lane loss at a junction.
     """
     global _sign_candidate, _sign_state
     try:
-        while not g_sign_queue.empty():
-            payload = g_sign_queue.get_nowait()
+        while True:
+            try:
+                payload = g_sign_queue.get_nowait()
+            except Empty:
+                break
             if not payload or 'name' not in payload:
                 continue
             name = payload.get('name')
             score = float(payload.get('score', 0.0))
             bbox = payload.get('bbox', None)
             ts = float(payload.get('ts', time.time()))
+            if time.time() - ts > 0.5 or name not in DURATION_BY_SIGN:
+                continue
+            # An action is latched while its sign remains visible. Re-arm after
+            # a gap, so a stop/turn cannot run repeatedly for the same sign.
+            if _sign_candidate['name'] == name:
+                gap = ts - _sign_candidate['last_seen_ts']
+                if gap > 0.8:
+                    _reset_candidate()
 
             if bbox is None:
                 continue
@@ -144,16 +235,19 @@ def _update_sign_state_from_queue():
                 _sign_candidate['first_seen_ts'] = ts
                 _sign_candidate['last_seen_ts'] = ts
                 _sign_candidate['count'] = 1
+                _sign_candidate['confirmed'] = False
                 _sign_candidate['score'] = score
                 _sign_candidate['bbox'] = bbox
 
             # Check confirmation criteria
             elapsed = _sign_candidate['last_seen_ts'] - _sign_candidate['first_seen_ts']
-            if (_sign_candidate['count'] >= MIN_CONSISTENT_DETECTIONS) or (elapsed >= CONFIRM_DELAY_SECONDS):
+            enough_evidence = (_sign_candidate['count'] >= MIN_CONSISTENT_DETECTIONS
+                               or elapsed >= CONFIRM_DELAY_SECONDS)
+            if not _sign_candidate['confirmed'] and enough_evidence:
                 # Promote: schedule execution after EXECUTE_AFTER_SECONDS
-                _promote_candidate_to_confirmed(_sign_candidate['name'], _sign_candidate['score'], _sign_candidate['bbox'])
-                # reset candidate to avoid re-promoting
-                _reset_candidate()
+                promoted = _promote_candidate_to_confirmed(_sign_candidate['name'], _sign_candidate['score'], _sign_candidate['bbox'])
+                # Keep the candidate latched until this sign disappears.
+                _sign_candidate['confirmed'] = promoted
     except Exception:
         pass
 
@@ -193,16 +287,16 @@ def apply_sign_action(base_throttle: float, base_steering: float):
         return throttle, steering
 
     if name == 'left':
-        steering = -0.9
-        throttle = min(throttle, 0.85)
+        steering = -0.72
+        throttle = 0.25  # cross the unmarked junction even if lane control stopped
     elif name == 'right':
-        steering = 0.9
-        throttle = min(throttle, 0.85)
+        steering = (FALLBACK_RIGHT_STEERING if _sign_state.get('source') == 'lane_loss'
+                    else 0.72)
+        throttle = 0.25
     elif name == 'straight':
-        steering = 0.0
-        throttle = max(throttle, 9.8)
+        steering = clamp_val(steering, -0.18, 0.18)
+        throttle = min(throttle, 0.48)
     elif name == 'stop':
-        steering = 0.0
         throttle = 0.0
     elif name == 'no_left':
         if steering < -0.2:
@@ -212,7 +306,7 @@ def apply_sign_action(base_throttle: float, base_steering: float):
             steering = 0.2
 
     throttle = max(0.0, min(1.0, throttle))
-    steering = max(-0.9, min(0.9, steering))
+    steering = max(-1.0, min(1.0, steering))
     return throttle, steering
 
 
@@ -229,6 +323,16 @@ async def handle_message(websocket):
     """
     Handle incoming messages from simulator.
     """
+    reset_control_state()
+    _reset_sign_session()
+    while True:
+        try:
+            g_sign_queue.get_nowait()
+        except Empty:
+            break
+    steering_limiter = SteeringLimiter()
+    previous_control_time = None
+    previous_throttle = 0.0
     async for message in websocket:
         try:
             data = json.loads(message)
@@ -240,8 +344,6 @@ async def handle_message(websocket):
         if not b64img:
             print("No image field in message, skip.")
             continue
-
-        current_speed = data.get("current_speed", None)
 
         # decode image
         try:
@@ -260,24 +362,30 @@ async def handle_message(websocket):
 
         # compute base control
         throttle, steering = 0.0, 0.0
-        if calculate_control_signal is None:
-            print("calculate_control_signal is not available.")
-        else:
-            try:
-                throttle, steering = calculate_control_signal(image, draw=draw)
-            except TypeError:
-                try:
-                    sp = current_speed if current_speed is not None else 0.0
-                    throttle, steering = calculate_control_signal(sp, image)
-                except Exception as e:
-                    print("calculate_control_signal failed alt:", e)
-                    throttle, steering = 0.0, 0.0
-            except Exception as e:
-                print("calculate_control_signal runtime error:", e)
-                throttle, steering = 0.0, 0.0
+        lane_status = None
+        try:
+            throttle, steering = calculate_control_signal(image, draw=draw)
+            lane_status = get_lane_status()
+        except Exception as e:
+            print("calculate_control_signal runtime error:", e)
+            throttle, steering = 0.0, 0.0
 
-        # apply sign action only if execute_at passed and within duration
+        _update_junction_turn(lane_status)
         throttle, steering = apply_sign_action(throttle, steering)
+
+        # Unsigned-junction fallback commands full right immediately. Other
+        # sources keep their normal steering smoothing and angle limits.
+        now = time.monotonic()
+        dt = 1 / 30 if previous_control_time is None else now - previous_control_time
+        previous_control_time = now
+        if _sign_state.get('source') == 'lane_loss' and _active_sign() == 'right':
+            steering = clamp_val(steering, -1.0, 1.0)
+            steering_limiter.value = steering
+        else:
+            steering = steering_limiter.update(steering, dt)
+        # Deceleration/stop is immediate; acceleration after a stop is gradual.
+        throttle = min(throttle, previous_throttle + 0.45 * clamp_val(dt, 0.001, 0.1))
+        previous_throttle = throttle
 
         # clamp final outputs
         throttle = clamp_val(throttle, 0.0, 1.0)
@@ -285,8 +393,13 @@ async def handle_message(websocket):
 
         # send image to sign detection process (non-blocking)
         try:
-            if not g_image_queue.full():
-                g_image_queue.put(image.copy())
+            g_image_queue.put_nowait((time.time(), image.copy()))
+        except Full:
+            try:
+                g_image_queue.get_nowait()
+                g_image_queue.put_nowait((time.time(), image.copy()))
+            except (Empty, Full):
+                pass
         except Exception:
             pass
 
@@ -295,7 +408,8 @@ async def handle_message(websocket):
             scheduled_name = _sign_state.get('name')
             exec_start = _sign_state.get('exec_start', 0.0)
             exec_in = max(0.0, exec_start - time.time()) if scheduled_name else 0.0
-            text = f"T:{throttle:.3f} S:{steering:.3f} Scheduled:{scheduled_name} ExecIn:{exec_in:.2f}"
+            waiting = _pending_turn['name'] if _pending_turn else None
+            text = f"T:{throttle:.3f} S:{steering:.3f} Wait:{waiting} Active:{scheduled_name} Loss:{_unsigned_loss_count}"
             cv2.putText(draw, text, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.imshow("Result", draw)
@@ -308,7 +422,6 @@ async def handle_message(websocket):
             "throttle": float(throttle),
             "steering": float(steering)
         })
-        print("SEND:", send_msg)
         try:
             await websocket.send(send_msg)
         except Exception as e:
@@ -316,7 +429,7 @@ async def handle_message(websocket):
         
 
 
-async def echo(websocket, path):
+async def echo(websocket, path=None):
     try:
         await handle_message(websocket)
     except websockets.ConnectionClosed:
@@ -326,7 +439,7 @@ async def echo(websocket, path):
 
 
 async def main():
-    async with websockets.serve(echo, "0.0.0.0", 4567, ping_interval=None):
+    async with websockets.serve(echo, "0.0.0.0", 4567, ping_interval=None, max_queue=1):
         print("WebSocket server started on 0.0.0.0:4567")
         await asyncio.Future()
 
@@ -350,7 +463,7 @@ if __name__ == '__main__':
         try:
             if g_image_queue is not None:
                 try:
-                    g_image_queue.put(None)
+                    g_image_queue.put_nowait(None)
                 except Exception:
                     pass
             if 'sign_process' in locals() and sign_process.is_alive():
@@ -358,4 +471,7 @@ if __name__ == '__main__':
                 sign_process.join(timeout=1.0)
         except Exception:
             pass
+        for queue in (g_image_queue, g_sign_queue):
+            queue.cancel_join_thread()
+            queue.close()
         cv2.destroyAllWindows()

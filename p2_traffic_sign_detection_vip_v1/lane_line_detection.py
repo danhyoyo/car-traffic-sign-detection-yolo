@@ -1,264 +1,251 @@
-"""
-lane_line_detection.py
-
-Improved lane detection and control based on lane_line_detection_good.py.
-Features:
-- Robust lane edge detection using Canny + small fallback row
-- PID steering controller tuned for responsive & stable driving
-- Compatibility wrapper calculate_control_signal that accepts:
-    * calculate_control_signal(image, draw=None)
-    * calculate_control_signal(current_speed, image)
-  so it works with both drive.py and drive_good.py calling styles.
-- Throttle control that reduces speed on sharp turns and when lanes are lost.
-"""
-
+"""Multi-row lane tracking and time-based, bounded steering for the simulator."""
+import math
 import time
-from typing import Tuple, Optional
+from numbers import Real
 
 import cv2
 import numpy as np
 
-# --- state ---
-_frame_id = 0
+# Smaller Y means looking farther ahead. Coordinates are fractions of image size.
+SCAN_ROWS = (0.84, 0.76, 0.68, 0.64)
+INITIAL_WIDTHS = (0.68, 0.57, 0.46, 0.405)
+PREVIEW_ROW = 0.64                 # Junction preview only; keep steering on the original rows.
+STEERING_KP = 1.7                # Error is normalized by half the image width.
+STEERING_KD = 0.025
+MAX_STEERING = 0.75
+STEERING_RATE = 2.6                # Steering units / second, including sign actions.
+CRUISE_THROTTLE = 0.6
+TURN_THROTTLE = 0.5
+LOST_LANE_STOP_SECONDS = 0.75
 
 
-class PID:
-    """Simple PID controller (supports calling as function)."""
-    def __init__(self, kp=0.00, ki=0.0, kd=0.00, setpoint=0.0):
-        # --- Tham số PID ---
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.setpoint = setpoint
-
-        # --- Thời gian ---
-        self.time_func = time.monotonic
-        self.last_time = self.time_func()
-
-        # --- Trạng thái ---
-        self.last_state = None
-        self.integral = 0.0
-
-    def __call__(self, state):
-        """
-        Tính tín hiệu điều khiển PID.
-        state: giá trị hiện tại (ví dụ: center_diff)
-        """
-        # --- Tính sai số ---
-        error = self.setpoint - state
-        d_state = 0.0 if self.last_state is None else (state - self.last_state)
-
-        # --- Lấy thời gian ---
-        now = self.time_func()
-        d_time = now - self.last_time
-        if d_time <= 0.0:
-            d_time = 1e-12  # tránh chia 0
-
-        # --- Thành phần PID ---
-        self.integral += self.ki * error * d_time
-        proportional = self.kp * error
-        derivative = -self.kd * d_state / d_time
-
-        # --- Tín hiệu điều khiển ---
-        control_signal = proportional + self.integral + derivative
-
-        # --- Cập nhật ---
-        self.last_state = state
-        self.last_time = now
-        print("pid: ", control_signal, "center_diff: ", state)
-        return control_signal
-
-pid = PID(kp=0.03, ki=0.0002, kd=0.004, setpoint=0.0)  # tuned default
-
-
-
-def clamp(x: float, lo: float, hi: float) -> float:
+def clamp(value, low, high):
     try:
-        xx = float(x)
-    except Exception:
-        return lo
-    return max(lo, min(hi, xx))
+        value = float(value)
+    except (TypeError, ValueError):
+        return low
+    return max(low, min(high, value)) if math.isfinite(value) else low
+
+
+class SteeringLimiter:
+    """Bound the final steering change; dt is explicit for reproducible tests."""
+    def __init__(self):
+        self.value = 0.0
+
+    def update(self, target, dt):
+        step = STEERING_RATE * clamp(dt, 0.001, 0.10)
+        target = clamp(target, -MAX_STEERING, MAX_STEERING)
+        self.value += clamp(target - self.value, -step, step)
+        return self.value
+
+
+def _groups(row, gap):
+    xs = np.flatnonzero(row)
+    if not len(xs):
+        return []
+    groups = np.split(xs, np.where(np.diff(xs) > gap)[0] + 1)
+    return [float(np.median(g)) for g in groups]
+
+
+class LaneController:
+    def __init__(self):
+        self.last_time = None
+        self.shape = None
+        self.widths = np.array(INITIAL_WIDTHS, dtype=float)
+        self.centers = np.full(len(SCAN_ROWS), 0.5)
+        self.error = 0.0
+        self.derivative = 0.0
+        self.last_error = None
+        self.steering_filter = 0.0
+        self.limiter = SteeringLimiter()
+        self.throttle = 0.0
+        self.lost_seconds = 0.0
+        self.confidence = 0.0
+        self.reliable = False
+        self.preview_seen = False
+        self.preview_lost = False
+        self.preview_lost_seconds = 0.0
+        self.samples = []
+
+    def detect(self, image):
+        h, w = image.shape[:2]
+        if self.shape != (h, w):
+            self.widths = np.array(INITIAL_WIDTHS, dtype=float)
+            self.centers = np.full(len(SCAN_ROWS), 0.5)
+            self.shape = (h, w)
+            self.preview_seen = False
+            self.preview_lost = False
+            self.preview_lost_seconds = 0.0
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        # White markings first: scenery edges should not pull the steering.
+        white = cv2.inRange(hsv, (0, 0, 155), (180, 90, 255))
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 70, 160)
+        samples = []
+        previous_center = None
+        for i, fraction in enumerate(SCAN_ROWS):
+            y = min(h - 1, int(h * fraction))
+            expected = self.centers[i] * w
+            if previous_center is not None:
+                expected = 0.55 * expected + 0.45 * previous_center
+            lane_width = self.widths[i] * w
+            found = None
+            for mask, quality in ((white, 1.0), (edges, 0.55)):
+                # Require support over a small band, rather than a single noisy row.
+                band = mask[max(0, y - 2):min(h, y + 3)]
+                candidates = _groups(np.count_nonzero(band, axis=0) >= 2,
+                                     max(3, int(w * 0.012)))
+                pairs = []
+                for j, left in enumerate(candidates):
+                    for right in candidates[j + 1:]:
+                        width = right - left
+                        center = (left + right) / 2
+                        if (0.55 * lane_width <= width <= 1.55 * lane_width
+                                and abs(center - expected) < 0.24 * w
+                                and (previous_center is None
+                                     or abs(center - previous_center) < 0.14 * w)):
+                            score = (abs(center - expected) / w
+                                     + 0.65 * abs(width - lane_width) / w)
+                            pairs.append((score, left, right))
+                if pairs:
+                    _, left, right = min(pairs)
+                    found = (left, right, quality, True)
+                    break
+                # Only extrapolate one edge near a previously expected boundary.
+                singles = []
+                for x in candidates:
+                    for side in (-1, 1):
+                        distance = abs(x - (expected + side * lane_width / 2))
+                        if distance < 0.12 * w:
+                            center = x - side * lane_width / 2
+                            if (previous_center is None
+                                    or abs(center - previous_center) < 0.14 * w):
+                                singles.append((distance, center))
+                if singles and found is None:
+                    _, center = min(singles)
+                    found = (center - lane_width / 2, center + lane_width / 2,
+                             quality * 0.4, False)
+            if found is None:
+                continue
+            left, right, quality, paired = found
+            center = (left + right) / 2
+            if paired:
+                self.widths[i] = 0.92 * self.widths[i] + 0.08 * (right - left) / w
+            self.centers[i] = center / w
+            previous_center = center
+            samples.append((fraction, center / w, quality, left, right, y))
+        self.samples = samples
+        return samples
+
+    def update(self, image, draw=None, dt=None):
+        now = time.monotonic()
+        if dt is None:
+            dt = 1 / 30 if self.last_time is None else now - self.last_time
+        self.last_time = now
+        elapsed = clamp(dt, 0.001, 1.0)
+        dt = clamp(dt, 0.001, 0.10)
+        if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+            samples = []
+        else:
+            samples = self.detect(image)
+        preview_visible = any(s[0] == PREVIEW_ROW for s in samples)
+        if preview_visible:
+            self.preview_seen = True
+            self.preview_lost_seconds = 0.0
+        elif self.preview_seen:
+            self.preview_lost_seconds += elapsed
+        self.preview_lost = self.preview_seen and not preview_visible
+        steering_samples = [s for s in samples if s[0] != PREVIEW_ROW]
+        self.confidence = sum(s[2] for s in steering_samples) / (len(SCAN_ROWS) - 1)
+        reliable = len(steering_samples) >= 2 and self.confidence >= 0.22
+        self.reliable = reliable
+        if reliable:
+            self.lost_seconds = 0.0
+            # Prefer far rows, but keep near rows for lateral position recovery.
+            weights = np.array([s[2] * (1.5 if s[0] <= 0.68 else 1.0)
+                                for s in steering_samples])
+            target = float(np.average([s[1] for s in steering_samples], weights=weights))
+            raw_error = (target - 0.5) * 2.0
+            # A small dead band suppresses alternating corrections on straights.
+            raw_error = math.copysign(max(0.0, abs(raw_error) - 0.012), raw_error)
+            self.error += (1 - math.exp(-dt / 0.10)) * (raw_error - self.error)
+            derivative = 0 if self.last_error is None else (self.error - self.last_error) / dt
+            self.derivative += (1 - math.exp(-dt / 0.16)) * (derivative - self.derivative)
+            self.last_error = self.error
+            target_steering = STEERING_KP * self.error + STEERING_KD * self.derivative
+        else:
+            self.lost_seconds += elapsed
+            self.last_error = None
+            self.derivative = 0.0
+            # Brief gaps retain the last bend; prolonged loss gently centers and stops.
+            target_steering = self.steering_filter * math.exp(-dt / 0.45)
+        target_steering = clamp(target_steering, -MAX_STEERING, MAX_STEERING)
+        self.steering_filter += (1 - math.exp(-dt / 0.08)) * (target_steering - self.steering_filter)
+        steering = self.limiter.update(self.steering_filter, dt)
+        turn = clamp(max(abs(target_steering), abs(steering)) / 0.6, 0, 1)
+        target_throttle = CRUISE_THROTTLE - (CRUISE_THROTTLE - TURN_THROTTLE) * turn
+        target_throttle *= 0.55 + 0.45 * self.confidence
+        if not reliable:
+            target_throttle = min(target_throttle, 0.18)
+        if self.lost_seconds >= LOST_LANE_STOP_SECONDS:
+            self.throttle = 0.0
+        else:
+            rate = 0.45 if target_throttle > self.throttle else 1.8
+            self.throttle += clamp(target_throttle - self.throttle, -rate * dt, rate * dt)
+        if draw is not None and image is not None:
+            h, w = draw.shape[:2]
+            preview_y = int(h * PREVIEW_ROW)
+            cv2.line(draw, (0, preview_y), (w - 1, preview_y),
+                     (0, 0, 255) if self.preview_lost else (255, 0, 255), 1)
+            preview_text = ('LOST' if self.preview_lost else
+                            'OK' if self.preview_seen else 'WAIT')
+            cv2.putText(draw, f"Far preview: {preview_text}", (10, h - 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+            for _, center, quality, left, right, y in samples:
+                color = (0, 255, 0) if quality >= 0.5 else (0, 180, 255)
+                cv2.line(draw, (int(clamp(left, 0, w-1)), y),
+                         (int(clamp(right, 0, w-1)), y), color, 1)
+                cv2.circle(draw, (int(center * w), y), 4, (0, 0, 255), -1)
+            cv2.putText(draw, f"Lane confidence:{self.confidence:.2f} Lost:{self.lost_seconds:.2f}s",
+                        (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        return float(self.throttle), float(steering)
+
+
+_controller = LaneController()
+
+
+def reset_control_state():
+    global _controller
+    _controller = LaneController()
+
+
+def get_lane_status():
+    """Expose the current frame's lane result without running detection twice."""
+    return {'reliable': _controller.reliable,
+            'lost_seconds': _controller.lost_seconds,
+            'preview_lost': _controller.preview_lost,
+            'preview_lost_seconds': _controller.preview_lost_seconds}
 
 
 def find_lane_lines(image):
+    """Legacy three-value interface, using the closest available preview row."""
+    samples = _controller.detect(image)
+    if not samples:
+        return -1, -1, image.shape[1] // 2
+    sample = min(samples, key=lambda s: abs(s[0] - 0.68))
+    return int(sample[3]), int(sample[4]), image.shape[1] // 2
+
+
+def calculate_control_signal(*args, **kwargs):
+    """Accept (image, draw), (speed, image, draw), or image=/draw= keywords.
+
+    Speed telemetry has no documented unit here; throttle does not assume one.
     """
-    Tìm hai biên trái/phải của làn đường (đơn giản)
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (11, 11), 0)
-    edges = cv2.Canny(blur, 150, 200)
-
-    height, width = edges.shape
-    interested_line_y = int(height * 0.9)
-    line_data = edges[interested_line_y, :]
-
-    left_point = -1
-    right_point = -1
-    lane_width = 400
-    center = width // 2
-
-    # tìm trái
-    for x in range(center, 0, -1):
-        if line_data[x] > 0:
-            left_point = x
-            break
-
-    # tìm phải
-    for x in range(center, width):
-        if line_data[x] > 0:
-            right_point = x
-            break
-
-    # Dự đoán nếu chỉ thấy 1 bên
-    if left_point != -1 and right_point == -1:
-        right_point = left_point + lane_width
-    elif right_point != -1 and left_point == -1:
-        left_point = right_point - lane_width
-    print("vi tri", left_point, right_point, center)
-    return left_point, right_point, center
-
-
-def birdview_transform(img: np.ndarray) -> np.ndarray:
-    """
-    Optional bird-view transform. Keeps default IMAGE_H/W of current image size.
-    """
-    h, w = img.shape[:2]
-    IMAGE_H = h
-    IMAGE_W = w
-
-    src = np.float32([[0, IMAGE_H], [IMAGE_W, IMAGE_H],
-                      [0, IMAGE_H * 0.4], [IMAGE_W, IMAGE_H * 0.4]])
-    dst = np.float32([[int(IMAGE_W*0.375), IMAGE_H],
-                      [int(IMAGE_W*0.625), IMAGE_H],
-                      [-int(IMAGE_W*0.25), 0],
-                      [IMAGE_W + int(IMAGE_W*0.25), 0]])
-    M = cv2.getPerspectiveTransform(src, dst)
-    warped = cv2.warpPerspective(img, M, (IMAGE_W, IMAGE_H))
-    return warped
-
-
-# --- Thêm ở đầu file, global state để làm mượt throttle ---
-_last_throttle = 0.0
-
-def _compute_throttle(base_speed: float, steering: float, lanes_found: bool) -> float:
-    """
-    Compute throttle (0..1) from base_speed, steering magnitude and whether lanes are visible.
-    Added:
-    - reduced steering impact (steer_factor)
-    - minimum throttle (min_throttle)
-    - exponential smoothing using _last_throttle and alpha
-    """
-    global _last_throttle
-    # giảm nhạy với steering: hệ số thấp hơn (trước là 0.85)
-    steer_factor = 0.5  # <--- giảm từ 0.85 xuống 0.5 (thử điều chỉnh)
-    steer_mag = min(abs(steering), 1.0)
-    raw = base_speed * (1.0 - steer_mag * steer_factor)
-
-    # nếu lane không thấy, giảm tốc nhưng không quá thấp
-    if not lanes_found:
-        raw = min(raw, base_speed * 0.5)
-
-    # đặt min throttle để không đi quá chậm
-    min_throttle = 0.32  # <-- tăng lên nếu muốn nhanh hơn
-    raw = max(raw, min_throttle)
-
-    # smoothing (low-pass)
-    alpha = 0.45  # 0..1, nhỏ => mượt hơn. thử 0.3..0.6
-    throttle = alpha * raw + (1.0 - alpha) * _last_throttle
-
-    # cập nhật trạng thái
-    _last_throttle = throttle
-
-    return clamp(throttle, 0.0, 1.0)
-
-
-def calculate_control_signal(*args, **kwargs) -> Tuple[float, float]:
-    """
-    Compatibility wrapper. Supports two call styles:
-    1) calculate_control_signal(image, draw=None)
-    2) calculate_control_signal(current_speed, image)
-
-    Returns (throttle, steering_angle)
-    throttle in [0,1], steering_angle in [-1,1]
-    """
-    global _frame_id
-    _frame_id += 1
-
-    image = None
-    draw = kwargs.get("draw", None)
-    current_speed = None
-
-    if len(args) == 1:
-        image = args[0]
-    elif len(args) == 2:
-        a0, a1 = args[0], args[1]
-        if isinstance(a0, (int, float)):
-            current_speed = float(a0)
-            image = a1
-        else:
-            image = a0
-            draw = a1
-    elif len(args) >= 3:
-        if isinstance(args[0], (int, float)):
-            current_speed = float(args[0])
-            image = args[1]
-            draw = args[2]
-        else:
-            image = args[0]
-            draw = args[1]
-
-    if image is None:
-        image = kwargs.get("image", None)
-    if image is None:
-        return 0.0, 0.0
-
-    try:
-        left_point, right_point, im_center = find_lane_lines(image)
-    except Exception:
-        return 0.0, 0.0
-
-    steering = 0.0
-    lanes_found = (left_point != -1 and right_point != -1)
-
-    if lanes_found:
-        center_point = (left_point + right_point) // 2
-        center_diff = center_point - im_center  # positive -> lane center is to the right 
-        steering = -pid(center_diff)
-        steering =clamp(steering, -0.9, 0.9)
-    else:
-        if left_point != -1:
-            steering = -pid((left_point + 60) - im_center)
-            steering = lamp(steering, -0.6, 0.6)
-        elif right_point != -1:
-            steering = -pid((right_point - 60) - im_center)
-            steering = lamp(steering, -0.6, 0.6)
-        else:
-            steering = 0.0
-    print("steering_angle", steering)
-    base_speed = 0.91
-    if current_speed is not None:
-        try:
-            cs = float(current_speed)
-            if cs > 0.0:
-                base_speed = clamp(1.2 - cs, 0.3, 1.0)
-        except Exception:
-            base_speed = 0.9
-
-    throttle = _compute_throttle(base_speed, steering, lanes_found)
-
-    if draw is not None:
-        try:
-            h, w = draw.shape[:2]
-            y_line = int(h * 0.9)
-            cv2.line(draw, (0, y_line), (w, y_line), (0, 0, 255), 2)
-            if left_point != -1:
-                cv2.circle(draw, (left_point, y_line), 6, (255, 255, 0), -1)
-            if right_point != -1:
-                cv2.circle(draw, (right_point, y_line), 6, (0, 255, 0), -1)
-            cv2.circle(draw, (im_center, y_line), 4, (255, 0, 0), -1)
-            txt = f"T:{throttle:.3f} S:{steering:.3f}"
-            cv2.putText(draw, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        except Exception:
-            pass
-
-    return float(throttle), float(steering)
+    draw = kwargs.get('draw')
+    image = kwargs.get('image')
+    if args:
+        offset = 1 if isinstance(args[0], Real) else 0
+        image = args[offset] if len(args) > offset else image
+        if len(args) > offset + 1:
+            draw = args[offset + 1]
+    return _controller.update(image, draw=draw, dt=kwargs.get('dt'))
