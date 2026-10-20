@@ -1,0 +1,4 @@
+numpy==1.19.3
+opencv-python
+websockets==11.0.3
+Pillow
